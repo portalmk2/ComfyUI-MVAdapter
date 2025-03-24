@@ -583,6 +583,7 @@ class MVAdapterT2MVSDXLPipeline(StableDiffusionXLPipeline, CustomAdapterMixin):
                     timestep_cond=timestep_cond,
                     cross_attention_kwargs={
                         "mv_scale": mv_scale,
+                        "num_views": num_images_per_prompt,
                         **(self.cross_attention_kwargs or {}),
                     },
                     down_intrablock_additional_residuals=down_intrablock_additional_residuals,

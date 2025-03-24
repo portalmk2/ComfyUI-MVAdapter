@@ -6,8 +6,6 @@ from .scheduler_utils import SNR_to_betas, compute_snr
 
 
 class ShiftSNRScheduler:
-    SHIFT_MODES = ["default", "interpolated"]
-
     def __init__(
         self,
         noise_scheduler: Any,

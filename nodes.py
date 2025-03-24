@@ -177,7 +177,7 @@ class DiffusersMVSchedulerLoader:
                 "scheduler_name": (list(SCHEDULERS.keys()),),
                 "shift_snr": ("BOOLEAN", {"default": True}),
                 "shift_mode": (
-                    list(ShiftSNRScheduler.SHIFT_MODES),
+                    ["default", "interpolated"],
                     {"default": "interpolated"},
                 ),
                 "shift_scale": (
