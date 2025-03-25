@@ -25,6 +25,7 @@ from .mvadapter.pipelines.pipeline_mvadapter_t2mv_sdxl import MVAdapterT2MVSDXLP
 from .mvadapter.schedulers.scheduling_shift_snr import ShiftSNRScheduler
 from .mvadapter.utils import get_orthogonal_camera, make_image_grid, tensor_to_image
 from .mvadapter.utils.render import NVDiffRastContextWrapper, render
+from .mvadapter.utils.geometry import get_plucker_embeds_from_cameras_ortho
 
 class DiffusersMVPipelineLoader:
     def __init__(self):
@@ -445,7 +446,6 @@ class DiffusersMVSampler:
         return {
             "required": {
                 "pipeline": ("PIPELINE",),
-                "num_views": ("INT", {"default": 6, "min": 1, "max": 12}),
                 "prompt": (
                     "STRING",
                     {"multiline": True, "default": "an astronaut riding a horse"},
@@ -474,9 +474,9 @@ class DiffusersMVSampler:
             },
             "optional": {
                 "reference_image": ("IMAGE",),
-                "controlnet_image": ("IMAGE",),
-                "controlnet_conditioning_scale": ("FLOAT", {"default": 1.0}),
-                "azimuth_degrees": ("LIST", {"default": [0, 45, 90, 180, 270, 315]}),
+                "control_image": ("IMAGE",),
+                "control_conditioning_scale": ("FLOAT", {"default": 1.0}),
+                "camera_config": ("MVADAPTER_CAMERA",),
             },
         }
 
@@ -489,7 +489,6 @@ class DiffusersMVSampler:
     def sample(
         self,
         pipeline,
-        num_views,
         prompt,
         negative_prompt,
         height,
@@ -498,14 +497,54 @@ class DiffusersMVSampler:
         cfg,
         seed,
         reference_image=None,
-        controlnet_image=None,
-        controlnet_conditioning_scale=1.0,
-        azimuth_degrees=[0, 45, 90, 180, 270, 315],
+        control_image=None,
+        control_conditioning_scale=1.0,
+        camera_config=None,
     ):
-        num_views = len(azimuth_degrees)
-        control_images = prepare_camera_embed(
-            num_views, width, self.torch_device, azimuth_degrees
-        )
+        if camera_config is None:
+            camera_config = MVAdapterCameraConfig.get_default_camera_config()
+        
+        assert 'camera_elevs' in camera_config
+        assert 'camera_azims' in camera_config
+        
+        num_views = len(camera_config['camera_azims'])
+        assert num_views == len(camera_config['camera_elevs'])
+
+        if control_image is not None:
+            if isinstance(control_image, list) or isinstance(control_image, tuple):
+                pos_maps = control_image[0]
+                nrm_maps = control_image[1]
+            else:
+                pos_maps = control_image[:num_views]
+                nrm_maps = control_image[num_views:]
+            control_image = (
+                torch.cat(
+                    [
+                        pos_maps,
+                        nrm_maps
+                    ],
+                    dim=-1,
+                )
+                .permute(0, 3, 1, 2)
+                .to(self.torch_device)
+            )
+        else:
+            cameras = get_orthogonal_camera(
+                elevation_deg=camera_config['camera_elevs'],
+                azimuth_deg=[x-90 for x in camera_config['camera_azims']],
+                distance=[camera_config.get('camera_dist', 1.8)] * num_views,
+                left=camera_config.get('left', -0.55),
+                right=camera_config.get('right', 0.55),
+                bottom=camera_config.get('bottom', -0.55),
+                top=camera_config.get('top', 0.55),
+                device=self.torch_device,
+            )
+
+            plucker_embeds = get_plucker_embeds_from_cameras_ortho(
+                cameras.c2w, [camera_config.get('ortho_scale', 1.1)] * num_views, width
+            )
+            control_image = ((plucker_embeds + 1.0) / 2.0).clamp(0, 1)
+            print(control_image.shape)
 
         pipe_kwargs = {}
         if reference_image is not None:
@@ -515,29 +554,27 @@ class DiffusersMVSampler:
                     "reference_conditioning_scale": 1.0,
                 }
             )
-        if controlnet_image is not None:
-            controlnet_image = convert_tensors_to_images(controlnet_image)
+        if control_image is not None:
             pipe_kwargs.update(
                 {
-                    "controlnet_image": controlnet_image,
-                    "controlnet_conditioning_scale": controlnet_conditioning_scale,
+                    "control_image": control_image,
+                    "control_conditioning_scale": control_conditioning_scale,
                 }
             )
 
         images = pipeline(
             prompt=prompt,
+            negative_prompt=negative_prompt,
             height=height,
             width=width,
             num_inference_steps=steps,
             guidance_scale=cfg,
             num_images_per_prompt=num_views,
-            control_image=control_images,
-            control_conditioning_scale=1.0,
-            negative_prompt=negative_prompt,
             generator=torch.Generator(self.torch_device).manual_seed(seed),
-            cross_attention_kwargs={"num_views": num_views},
+            cross_attention_kwargs={"scale": 1.0, "num_views": num_views},
             **pipe_kwargs,
         ).images
+
         return (convert_images_to_tensors(images),)
 
 
@@ -668,51 +705,51 @@ class ControlImagePreprocessor:
         return (convert_images_to_tensors(images),)
 
 
-class ViewSelector:
-    def __init__(self):
-        pass
+# class ViewSelector:
+#     def __init__(self):
+#         pass
 
-    @classmethod
-    def INPUT_TYPES(s):
-        return {
-            "required": {
-                "front_view": ("BOOLEAN", {"default": True}),
-                "front_right_view": ("BOOLEAN", {"default": True}),
-                "right_view": ("BOOLEAN", {"default": True}),
-                "back_view": ("BOOLEAN", {"default": True}),
-                "left_view": ("BOOLEAN", {"default": True}),
-                "front_left_view": ("BOOLEAN", {"default": True}),
-            }
-        }
+#     @classmethod
+#     def INPUT_TYPES(s):
+#         return {
+#             "required": {
+#                 "front_view": ("BOOLEAN", {"default": True}),
+#                 "front_right_view": ("BOOLEAN", {"default": True}),
+#                 "right_view": ("BOOLEAN", {"default": True}),
+#                 "back_view": ("BOOLEAN", {"default": True}),
+#                 "left_view": ("BOOLEAN", {"default": True}),
+#                 "front_left_view": ("BOOLEAN", {"default": True}),
+#             }
+#         }
 
-    RETURN_TYPES = ("LIST",)
-    FUNCTION = "process"
-    CATEGORY = "MV-Adapter"
+#     RETURN_TYPES = ("LIST",)
+#     FUNCTION = "process"
+#     CATEGORY = "MV-Adapter"
 
-    def process(
-        self,
-        front_view,
-        front_right_view,
-        right_view,
-        back_view,
-        left_view,
-        front_left_view,
-    ):
-        azimuth_deg = []
-        if front_view:
-            azimuth_deg.append(0)
-        if front_right_view:
-            azimuth_deg.append(45)
-        if right_view:
-            azimuth_deg.append(90)
-        if back_view:
-            azimuth_deg.append(180)
-        if left_view:
-            azimuth_deg.append(270)
-        if front_left_view:
-            azimuth_deg.append(315)
+#     def process(
+#         self,
+#         front_view,
+#         front_right_view,
+#         right_view,
+#         back_view,
+#         left_view,
+#         front_left_view,
+#     ):
+#         azimuth_deg = []
+#         if front_view:
+#             azimuth_deg.append(0)
+#         if front_right_view:
+#             azimuth_deg.append(45)
+#         if right_view:
+#             azimuth_deg.append(90)
+#         if back_view:
+#             azimuth_deg.append(180)
+#         if left_view:
+#             azimuth_deg.append(270)
+#         if front_left_view:
+#             azimuth_deg.append(315)
 
-        return (azimuth_deg,)
+#         return (azimuth_deg,)
 
 
 
@@ -742,7 +779,7 @@ class MVAdapterCameraConfig:
     def INPUT_TYPES(s):
         return {
             "required": {
-                "camera_azimuths": ("STRING", {"default": "-90, 0, 90, 180, 90, 90", "multiline": False}),
+                "camera_azimuths": ("STRING", {"default": "0, 90, 180, 270, 180, 180", "multiline": False}),
                 "camera_elevations": ("STRING", {"default": "0, 0, 0, 0, 90, -90", "multiline": False}),
                 "camera_distance": ("FLOAT", {"default": 1.8, "min": 0.1, "max": 10.0, "step": 0.001}),
                 "ortho_scale": ("FLOAT", {"default": 1.1, "min": 0.1, "max": 2, "step": 0.001}),
@@ -753,6 +790,19 @@ class MVAdapterCameraConfig:
     RETURN_NAMES = ("camera_config",)
     FUNCTION = "process"
     CATEGORY = "MV-Adapter"
+
+    @classmethod
+    def get_default_camera_config(cls):
+        return {
+            "camera_azims": [0, 90, 180, 270, 180, 180],
+            "camera_elevs": [0, 0, 0, 0, 89.99, -89.99],
+            "camera_dist": 1.8,         
+            "ortho_scale": 1.1,
+            "left": -0.55,
+            "right": 0.55,
+            "bottom": -0.55,
+            "top": 0.55,
+        }
 
     def process(self, camera_azimuths, camera_elevations, camera_distance, ortho_scale):
         angles_list = list(map(float, camera_azimuths.replace(" ", "").split(',')))
@@ -765,7 +815,6 @@ class MVAdapterCameraConfig:
             "camera_azims": angles_list,
             "camera_elevs": elevations_list,
             "camera_dist": camera_distance,
-            "camera_dists": dist_list,            
             "ortho_scale": ortho_scale,
             "left": -0.5*ortho_scale,
             "right": 0.5*ortho_scale,
@@ -791,7 +840,7 @@ class MVAdapterRenderMultiView:
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "MASK",)
-    RETURN_NAMES = ("normal_maps", "position_maps", "masks")
+    RETURN_NAMES = ("position_maps", "normal_maps", "masks")
     FUNCTION = "process"
     CATEGORY = "MV-Adapter"
 
@@ -802,22 +851,14 @@ class MVAdapterRenderMultiView:
 
     def process(self, trimesh, render_size, texture_size, camera_config=None):
         if camera_config == None:
-            camera_config = {
-                "camera_azims": [-90, 0, 90, 180, 90, 90],
-                "camera_elevs": [0, 0, 0, 0, 89.99, -89.99],
-                "camera_dist": 1.8,
-                "camera_dists": [1.8] * 6,            
-                "ortho_scale": 1.1,
-                "left": -0.55,
-                "right": 0.55,
-                "bottom": -0.55,
-                "top": 0.55,
-            }
+            camera_config = MVAdapterCameraConfig.get_default_camera_config()
+
+        num_views = len(camera_config['camera_azims'])
 
         cameras = get_orthogonal_camera(
             elevation_deg = camera_config['camera_elevs'],
-            azimuth_deg = camera_config['camera_azims'],
-            distance = camera_config['camera_dists'],
+            azimuth_deg = [x - 90 for x in camera_config['camera_azims']],
+            distance = [camera_config['camera_dist']] * num_views,
             left=camera_config['left'],
             right=camera_config['right'],
             bottom=camera_config['bottom'],
@@ -839,11 +880,11 @@ class MVAdapterRenderMultiView:
         )
 
         return (
-            (render_out.normal / 2 + 0.5).clamp(0, 1).cpu().float(), 
             (render_out.pos + 0.5).clamp(0, 1).cpu().float(), 
-            render_out.mask.squeeze(-1).cpu().float(),)
+            (render_out.normal / 2 + 0.5).clamp(0, 1).cpu().float(), 
+            render_out.mask.squeeze(-1).cpu().float(),
+        )
 
-        return ([],[],[])
 
 
 NODE_CLASS_MAPPINGS = {
@@ -859,7 +900,7 @@ NODE_CLASS_MAPPINGS = {
     "ImagePreprocessor": ImagePreprocessor,
     "ControlNetModelLoader": ControlNetModelLoader,
     "ControlImagePreprocessor": ControlImagePreprocessor,
-    "ViewSelector": ViewSelector,
+    #"ViewSelector": ViewSelector,
     "MVAdapterLoadMesh": MVAdapterLoadMesh,
     "MVAdapterCameraConfig": MVAdapterCameraConfig,
     "MVAdapterRenderMultiView": MVAdapterRenderMultiView,
@@ -878,7 +919,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ImagePreprocessor": "Image Preprocessor",
     "ControlNetModelLoader": "ControlNet Model Loader",
     "ControlImagePreprocessor": "Control Image Preprocessor",
-    "ViewSelector": "View Selector",
+    #"ViewSelector": "View Selector",
     "MVAdapterLoadMesh": "MV-Adapter Load Mesh",
     "MVAdapterCameraConfig": "MV-Adapter Camera Config",
     "MVAdapterRenderMultiView": "MV-Adapter Render Multi-View",

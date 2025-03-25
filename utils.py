@@ -73,8 +73,11 @@ SCHEDULERS = {
 
 MVADAPTERS = [
     "mvadapter_t2mv_sdxl.safetensors",
+    "mvadapter_tg2mv_sdxl.safetensors",
     "mvadapter_i2mv_sdxl.safetensors",
     "mvadapter_i2mv_sdxl_beta.safetensors",
+    "mvadapter_ig2mv_sdxl.safetensors",
+    "mvadapter_ig2mv_partial_sdxl.safetensors",    
     "mvadapter_t2mv_sd21.safetensors",
     "mvadapter_i2mv_sd21.safetensors",
 ]
