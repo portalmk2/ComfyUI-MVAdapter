@@ -2,9 +2,11 @@
 
 import io
 import os
+from typing import Optional
 import torch
 import requests
 import numpy as np
+import trimesh
 from PIL import Image
 from omegaconf import OmegaConf
 from torchvision.transforms import ToTensor
@@ -41,6 +43,7 @@ from .mvadapter.utils import (
     get_plucker_embeds_from_cameras_ortho,
     make_image_grid,
 )
+from .mvadapter.utils.render import TexturedMesh
 
 
 NODE_CACHE_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "cache")
@@ -350,3 +353,109 @@ def preprocess_image(image: Image.Image, height, width):
     image = Image.fromarray(image)
 
     return image
+
+
+def load_mesh_from_trimesh(
+    mesh: trimesh.Trimesh,
+    rescale: bool = False,
+    move_to_center: bool = False,
+    scale: float = 0.5,
+    flip_uv: bool = True,
+    merge_vertices: bool = True,
+    default_uv_size: int = 2048,
+    shape_init_mesh_up: str = "+y",
+    shape_init_mesh_front: str = "+x",
+    front_x_to_y: bool = False,
+    device: Optional[str] = None,
+    return_transform: bool = False,
+) -> TexturedMesh:
+    if isinstance(mesh, trimesh.Scene):
+        mesh = mesh.dump(concatenate=True)
+
+    # move to center
+    if move_to_center:
+        centroid = mesh.vertices.mean(0)
+        mesh.vertices = mesh.vertices - centroid
+
+    # rescale
+    if rescale:
+        max_scale = np.abs(mesh.vertices).max()
+        mesh.vertices = mesh.vertices / max_scale * scale
+
+    dirs = ["+x", "+y", "+z", "-x", "-y", "-z"]
+    dir2vec = {
+        "+x": np.array([1, 0, 0]),
+        "+y": np.array([0, 1, 0]),
+        "+z": np.array([0, 0, 1]),
+        "-x": np.array([-1, 0, 0]),
+        "-y": np.array([0, -1, 0]),
+        "-z": np.array([0, 0, -1]),
+    }
+    if shape_init_mesh_up not in dirs or shape_init_mesh_front not in dirs:
+        raise ValueError(
+            f"shape_init_mesh_up and shape_init_mesh_front must be one of {dirs}."
+        )
+    if shape_init_mesh_up[1] == shape_init_mesh_front[1]:
+        raise ValueError(
+            "shape_init_mesh_up and shape_init_mesh_front must be orthogonal."
+        )
+    z_, x_ = (
+        dir2vec[shape_init_mesh_up],
+        dir2vec[shape_init_mesh_front],
+    )
+    y_ = np.cross(z_, x_)
+    std2mesh = np.stack([x_, y_, z_], axis=0).T
+    mesh2std = np.linalg.inv(std2mesh)
+    mesh.vertices = np.dot(mesh2std, mesh.vertices.T).T
+    if front_x_to_y:
+        x = mesh.vertices[:, 1].copy()
+        y = -mesh.vertices[:, 0].copy()
+        mesh.vertices[:, 0] = x
+        mesh.vertices[:, 1] = y
+
+    v_pos = torch.tensor(mesh.vertices, dtype=torch.float32)
+    t_pos_idx = torch.tensor(mesh.faces, dtype=torch.int64)
+
+    if hasattr(mesh, "visual") and hasattr(mesh.visual, "uv"):
+        v_tex = torch.tensor(mesh.visual.uv, dtype=torch.float32)
+        if flip_uv:
+            v_tex[:, 1] = 1.0 - v_tex[:, 1]
+        t_tex_idx = t_pos_idx.clone()
+        if (
+            hasattr(mesh.visual.material, "baseColorTexture")
+            and mesh.visual.material.baseColorTexture
+        ):
+            texture = torch.tensor(
+                np.array(mesh.visual.material.baseColorTexture) / 255.0,
+                dtype=torch.float32,
+            )[..., :3]
+        else:
+            texture = torch.zeros(
+                (default_uv_size, default_uv_size, 3), dtype=torch.float32
+            )
+    else:
+        v_tex = None
+        t_tex_idx = None
+        texture = None
+
+    textured_mesh = TexturedMesh(
+        v_pos=v_pos,
+        t_pos_idx=t_pos_idx,
+        v_tex=v_tex,
+        t_tex_idx=t_tex_idx,
+        texture=texture,
+    )
+
+    if merge_vertices:
+        mesh.merge_vertices(merge_tex=True)
+        textured_mesh.set_stitched_mesh(
+            torch.tensor(mesh.vertices, dtype=torch.float32),
+            torch.tensor(mesh.faces, dtype=torch.int64),
+        )
+
+    textured_mesh.to(device)
+
+    if return_transform:
+        return textured_mesh, np.array(centroid), max_scale / scale
+
+    return textured_mesh

@@ -8,6 +8,7 @@ from .utils import (
     SCHEDULERS,
     PIPELINES,
     MVADAPTERS,
+    load_mesh_from_trimesh,
     vae_pt_to_vae_diffuser,
     convert_images_to_tensors,
     convert_tensors_to_images,
@@ -16,13 +17,14 @@ from .utils import (
 )
 from comfy.model_management import get_torch_device
 import folder_paths
-
+import trimesh as Trimesh
 from diffusers import StableDiffusionXLPipeline, AutoencoderKL, ControlNetModel
 from transformers import AutoModelForImageSegmentation
 
 from .mvadapter.pipelines.pipeline_mvadapter_t2mv_sdxl import MVAdapterT2MVSDXLPipeline
 from .mvadapter.schedulers.scheduling_shift_snr import ShiftSNRScheduler
-
+from .mvadapter.utils import get_orthogonal_camera, make_image_grid, tensor_to_image
+from .mvadapter.utils.render import NVDiffRastContextWrapper, render
 
 class DiffusersMVPipelineLoader:
     def __init__(self):
@@ -713,6 +715,137 @@ class ViewSelector:
         return (azimuth_deg,)
 
 
+
+class MVAdapterLoadMesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "glb_path": ("STRING", {"default": "", "tooltip": "The glb path with mesh to load."}), 
+            }
+        }
+    RETURN_TYPES = ("TRIMESH",)
+    RETURN_NAMES = ("trimesh",)
+    OUTPUT_TOOLTIPS = ("The glb model with mesh to texturize.",)
+    
+    FUNCTION = "load"
+    CATEGORY = "MV-Adapter"
+    DESCRIPTION = "Loads a glb model from the given path."
+
+    def load(self, glb_path):        
+        trimesh = Trimesh.load(glb_path, force="mesh")        
+        return (trimesh,)
+
+
+class MVAdapterCameraConfig:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "camera_azimuths": ("STRING", {"default": "-90, 0, 90, 180, 90, 90", "multiline": False}),
+                "camera_elevations": ("STRING", {"default": "0, 0, 0, 0, 90, -90", "multiline": False}),
+                "camera_distance": ("FLOAT", {"default": 1.8, "min": 0.1, "max": 10.0, "step": 0.001}),
+                "ortho_scale": ("FLOAT", {"default": 1.1, "min": 0.1, "max": 2, "step": 0.001}),
+            },
+        }
+
+    RETURN_TYPES = ("MVADAPTER_CAMERA",)
+    RETURN_NAMES = ("camera_config",)
+    FUNCTION = "process"
+    CATEGORY = "MV-Adapter"
+
+    def process(self, camera_azimuths, camera_elevations, camera_distance, ortho_scale):
+        angles_list = list(map(float, camera_azimuths.replace(" ", "").split(',')))
+        elevations_list = list(map(float, camera_elevations.replace(" ", "").split(',')))
+        if len(angles_list) != len(elevations_list):
+            raise ValueError("Count of azimuth and elevation angles do not match")        
+        dist_list = [camera_distance] * len(angles_list)        
+
+        camera_config = {
+            "camera_azims": angles_list,
+            "camera_elevs": elevations_list,
+            "camera_dist": camera_distance,
+            "camera_dists": dist_list,            
+            "ortho_scale": ortho_scale,
+            "left": -0.5*ortho_scale,
+            "right": 0.5*ortho_scale,
+            "bottom": -0.5*ortho_scale,
+            "top": 0.5*ortho_scale,
+            }
+        
+        return (camera_config,)
+
+
+class MVAdapterRenderMultiView:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",),
+                "render_size": ("INT", {"default": 768, "min": 64, "max": 2048, "step": 16}),
+                "texture_size": ("INT", {"default": 768, "min": 64, "max": 2048, "step": 16}),
+            },
+            "optional": {
+                "camera_config": ("MVADAPTER_CAMERA",),
+            }
+        }
+
+    RETURN_TYPES = ("IMAGE", "IMAGE", "MASK",)
+    RETURN_NAMES = ("normal_maps", "position_maps", "masks")
+    FUNCTION = "process"
+    CATEGORY = "MV-Adapter"
+
+    def __init__(self):
+        self.loaded_controlnet = None
+        self.dtype = torch.float16
+        self.torch_device = get_torch_device()
+
+    def process(self, trimesh, render_size, texture_size, camera_config=None):
+        if camera_config == None:
+            camera_config = {
+                "camera_azims": [-90, 0, 90, 180, 90, 90],
+                "camera_elevs": [0, 0, 0, 0, 89.99, -89.99],
+                "camera_dist": 1.8,
+                "camera_dists": [1.8] * 6,            
+                "ortho_scale": 1.1,
+                "left": -0.55,
+                "right": 0.55,
+                "bottom": -0.55,
+                "top": 0.55,
+            }
+
+        cameras = get_orthogonal_camera(
+            elevation_deg = camera_config['camera_elevs'],
+            azimuth_deg = camera_config['camera_azims'],
+            distance = camera_config['camera_dists'],
+            left=camera_config['left'],
+            right=camera_config['right'],
+            bottom=camera_config['bottom'],
+            top=camera_config['top'],
+            device=self.torch_device,
+        )
+        ctx = NVDiffRastContextWrapper(device=self.torch_device)
+
+        mesh = load_mesh_from_trimesh(trimesh.copy(), rescale=True, device=self.torch_device)
+
+        render_out = render(
+            ctx,
+            mesh,
+            cameras,
+            height=render_size,
+            width=render_size,
+            render_attr=False,
+            normal_background=0.0,
+        )
+
+        return (
+            (render_out.normal / 2 + 0.5).clamp(0, 1).cpu().float(), 
+            (render_out.pos + 0.5).clamp(0, 1).cpu().float(), 
+            render_out.mask.squeeze(-1).cpu().float(),)
+
+        return ([],[],[])
+
+
 NODE_CLASS_MAPPINGS = {
     "LdmPipelineLoader": LdmPipelineLoader,
     "LdmVaeLoader": LdmVaeLoader,
@@ -727,6 +860,9 @@ NODE_CLASS_MAPPINGS = {
     "ControlNetModelLoader": ControlNetModelLoader,
     "ControlImagePreprocessor": ControlImagePreprocessor,
     "ViewSelector": ViewSelector,
+    "MVAdapterLoadMesh": MVAdapterLoadMesh,
+    "MVAdapterCameraConfig": MVAdapterCameraConfig,
+    "MVAdapterRenderMultiView": MVAdapterRenderMultiView,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -743,4 +879,7 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ControlNetModelLoader": "ControlNet Model Loader",
     "ControlImagePreprocessor": "Control Image Preprocessor",
     "ViewSelector": "View Selector",
+    "MVAdapterLoadMesh": "MV-Adapter Load Mesh",
+    "MVAdapterCameraConfig": "MV-Adapter Camera Config",
+    "MVAdapterRenderMultiView": "MV-Adapter Render Multi-View",
 }
