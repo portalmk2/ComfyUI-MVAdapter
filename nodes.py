@@ -705,54 +705,6 @@ class ControlImagePreprocessor:
         return (convert_images_to_tensors(images),)
 
 
-# class ViewSelector:
-#     def __init__(self):
-#         pass
-
-#     @classmethod
-#     def INPUT_TYPES(s):
-#         return {
-#             "required": {
-#                 "front_view": ("BOOLEAN", {"default": True}),
-#                 "front_right_view": ("BOOLEAN", {"default": True}),
-#                 "right_view": ("BOOLEAN", {"default": True}),
-#                 "back_view": ("BOOLEAN", {"default": True}),
-#                 "left_view": ("BOOLEAN", {"default": True}),
-#                 "front_left_view": ("BOOLEAN", {"default": True}),
-#             }
-#         }
-
-#     RETURN_TYPES = ("LIST",)
-#     FUNCTION = "process"
-#     CATEGORY = "MV-Adapter"
-
-#     def process(
-#         self,
-#         front_view,
-#         front_right_view,
-#         right_view,
-#         back_view,
-#         left_view,
-#         front_left_view,
-#     ):
-#         azimuth_deg = []
-#         if front_view:
-#             azimuth_deg.append(0)
-#         if front_right_view:
-#             azimuth_deg.append(45)
-#         if right_view:
-#             azimuth_deg.append(90)
-#         if back_view:
-#             azimuth_deg.append(180)
-#         if left_view:
-#             azimuth_deg.append(270)
-#         if front_left_view:
-#             azimuth_deg.append(315)
-
-#         return (azimuth_deg,)
-
-
-
 class MVAdapterLoadMesh:
     @classmethod
     def INPUT_TYPES(s):
@@ -772,7 +724,50 @@ class MVAdapterLoadMesh:
     def load(self, glb_path):        
         trimesh = Trimesh.load(glb_path, force="mesh")        
         return (trimesh,)
+    
+class MVAdapterNormalizeMesh:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "trimesh": ("TRIMESH",), 
+                "size": ("FLOAT", {"default": 1.0, "min": 0.0}),
+                "flip_x": ("BOOLEAN", {"default": False}),
+                "flip_y": ("BOOLEAN", {"default": False}),
+                "flip_z": ("BOOLEAN", {"default": False}),
+            }
+        }
+    RETURN_TYPES = ("TRIMESH",)
+    RETURN_NAMES = ("trimesh",)
+    
+    FUNCTION = "process"
+    CATEGORY = "MV-Adapter"
+    DESCRIPTION = "Resize the mesh based on its most significant axis."
 
+    def process(self, trimesh, size=1.0, flip_x=False, flip_y=False, flip_z=False):
+        min_bound = trimesh.bounds.min(axis=0)
+        max_bound = trimesh.bounds.max(axis=0)
+        extents = max_bound - min_bound
+
+        current_longest_length = extents.max()
+
+        if current_longest_length <= 1e-6:
+            scale_factor = 1.0
+        else:
+            scale_factor = size / current_longest_length
+
+        scales = [scale_factor] * 3
+        if flip_x:
+            scales[0] = -scale_factor
+        if flip_y:
+            scales[1] = -scale_factor
+        if flip_z:
+            scales[2] = -scale_factor
+        
+        transformed_mesh = trimesh.copy()
+        transformed_mesh.apply_scale(scales)
+
+        return (transformed_mesh,)
 
 class MVAdapterCameraConfig:
     @classmethod
@@ -885,7 +880,148 @@ class MVAdapterRenderMultiView:
             render_out.mask.squeeze(-1).cpu().float(),
         )
 
+class FillBackgroundWithColor:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),  # Input RGB or RGBA image tensor
+                "red": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "green": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "blue": ("FLOAT", {"default": 1.0, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "invert_alpha": ("BOOLEAN", {"default": False}),                 
+                "output_alpha": ("BOOLEAN", {"default": False}),
+            },
+            "optional": {
+                "mask": ("MASK",),  # Optional mask input
+            }
+        }
 
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    CATEGORY = "MV-Adapter"
+    FUNCTION = "process"
+
+    def process(self, image, red, green, blue, invert_alpha=False, output_alpha=False, mask=None):
+        background_color = torch.tensor([red, green, blue], dtype=image.dtype, device=image.device).view(1, 1, 1, 3)
+        
+        assert (mask is None) or (image.shape[:3] == mask.shape[:3])
+
+        output_images = []
+
+        # for img in image: # Iterate through batch if batch_size > 1
+        for i in range(image.shape[0]):            
+            img = image[i]
+            msk = mask[i] if mask is not None else None
+            
+            rgba_image = img.clone() # Clone to avoid modifying the original image
+            original_channels = rgba_image.shape[-1]
+            
+            alpha_channel = None # Initialize alpha_channel
+
+            if msk is not None:
+                # Use provided mask as alpha
+                mask_expanded = msk.float() # Ensure mask is float
+                if mask_expanded.ndim == 2: # (H, W) -> (H, W, 1)
+                    mask_expanded = mask_expanded.unsqueeze(-1)
+
+                alpha_channel = mask_expanded
+
+                if original_channels == 3: # RGB image with mask, convert to RGBA
+                    rgba_image = torch.cat([rgba_image, alpha_channel], dim=-1)
+                elif original_channels == 4: # RGBA image with mask, replace alpha
+                    rgba_image[:, :, 3:4] = alpha_channel
+                else:
+                    raise ValueError(f"Input image should have 3 (RGB) or 4 (RGBA) channels, but got {original_channels}")
+
+            elif original_channels == 4:
+                # Use existing alpha channel of RGBA image
+                alpha_channel = rgba_image[:, :, 3:4]
+            elif original_channels == 3:
+                # RGB image without mask, treat as opaque (alpha = 1)
+                alpha_channel = torch.ones_like(rgba_image[:,:,:1]) # Create an alpha channel of ones
+                rgba_image = torch.cat([rgba_image, alpha_channel], dim=-1) # Convert RGB to RGBA
+            else:
+                raise ValueError(f"Input image should have 3 (RGB) or 4 (RGBA) channels, but got {original_channels}")
+
+            if alpha_channel is None: # Safety check in case alpha_channel was not assigned.
+                raise Exception("Alpha channel was not properly assigned.")
+
+
+            rgb_channels = rgba_image[:, :, :3] # Extract RGB channels (now guaranteed to be RGB part of RGBA)
+            # alpha_channel is already extracted above
+
+            if invert_alpha:
+                alpha_channel = 1 - alpha_channel
+                
+            # Blend the background color with the original RGB based on alpha
+            blended_rgb = (rgb_channels * alpha_channel) + (background_color * (1 - alpha_channel))
+
+            rgba_image[:, :, :3] = blended_rgb # Replace RGB channels with blended ones
+
+            if not output_alpha:
+                rgba_image = rgba_image[:, :, :3] # Remove alpha channel if not required
+
+            output_images.append(rgba_image)
+
+        output_image_batch = torch.stack(output_images)
+        return (output_image_batch,)
+
+
+class InvertChannelsOfImages:
+    @classmethod
+    def INPUT_TYPES(s):
+        return {
+            "required": {
+                "image": ("IMAGE",),  # Input RGB or RGBA image tensor
+                "red": ("STRING", {"default": "no"}),
+                "green": ("STRING", {"default": "no"}),
+                "blue": ("STRING", {"default": "no"}),
+                "alpha": ("STRING", {"default": "no"}),
+            },
+        }
+
+    RETURN_TYPES = ("IMAGE",)
+    RETURN_NAMES = ("image",)
+    CATEGORY = "MV-Adapter"
+    FUNCTION = "process"
+
+    def process(self, image, red, green, blue, alpha):
+        output_images = []
+        image_count = image.shape[0]
+
+        def get_flip_flag(x):
+            return (x.lower() in ['1', 'true', 'true', 'yes', 'on', 'flip', 'invert'])
+        
+        def parse_list(chn):
+            l = list(map(get_flip_flag, chn.replace(" ", "").split(',')))
+            l += [l[-1]] * max(0, image_count - len(l))
+            return l
+        
+        red_list = parse_list(red)
+        green_list = parse_list(green)
+        blue_list = parse_list(blue)
+        alpha_list = parse_list(alpha)
+
+        # for img in image: # Iterate through batch if batch_size > 1
+        for i in range(image_count):            
+            img = image[i]
+            
+            rgba_image = img.clone() # Clone to avoid modifying the original image
+
+            if red_list[i]:                
+                rgba_image[:,:,0] = 1 - rgba_image[:,:,0]
+            if green_list[i]:                
+                rgba_image[:,:,1] = 1 - rgba_image[:,:,1]
+            if blue_list[i]:                
+                rgba_image[:,:,2] = 1 - rgba_image[:,:,2]
+            if alpha_list[i] and rgba_image.shape[-1] == 4:                
+                rgba_image[:,:,3] = 1 - rgba_image[:,:,3]
+
+            output_images.append(rgba_image)
+
+        output_image_batch = torch.stack(output_images)
+        return (output_image_batch,)
 
 NODE_CLASS_MAPPINGS = {
     "LdmPipelineLoader": LdmPipelineLoader,
@@ -901,9 +1037,12 @@ NODE_CLASS_MAPPINGS = {
     "ControlNetModelLoader": ControlNetModelLoader,
     "ControlImagePreprocessor": ControlImagePreprocessor,
     #"ViewSelector": ViewSelector,
+    "MVAdapterNormalizeMesh": MVAdapterNormalizeMesh,
     "MVAdapterLoadMesh": MVAdapterLoadMesh,
     "MVAdapterCameraConfig": MVAdapterCameraConfig,
     "MVAdapterRenderMultiView": MVAdapterRenderMultiView,
+    "FillBackgroundWithColor": FillBackgroundWithColor,
+    "InvertChannelsOfImages": InvertChannelsOfImages,
 }
 
 NODE_DISPLAY_NAME_MAPPINGS = {
@@ -920,7 +1059,10 @@ NODE_DISPLAY_NAME_MAPPINGS = {
     "ControlNetModelLoader": "ControlNet Model Loader",
     "ControlImagePreprocessor": "Control Image Preprocessor",
     #"ViewSelector": "View Selector",
+    "MVAdapterNormalizeMesh": "MV-Adapter Normalize Mesh",
     "MVAdapterLoadMesh": "MV-Adapter Load Mesh",
     "MVAdapterCameraConfig": "MV-Adapter Camera Config",
     "MVAdapterRenderMultiView": "MV-Adapter Render Multi-View",
+    "FillBackgroundWithColor": "Fill Background With Color",
+    "InvertChannelsOfImages": "Invert Channels of Images",
 }
